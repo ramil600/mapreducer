@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"time"
 )
 
@@ -41,18 +40,13 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
 	for {
-		// uncomment to send the Example RPC to the coordinator.
-		//CallExample()
 		task, err := requestTask()
 		if err != nil {
 			fmt.Println(err)
 		}
-		fmt.Println("Task received: ", task.Name, task.FileName)
 
 		if task.Name == exitTask {
-			fmt.Println("exiting on request")
 			return
 		}
 		if task.Name == mapTask {
@@ -64,15 +58,12 @@ func Worker(mapf func(string, string) []KeyValue,
 				fmt.Println(err)
 			}
 		}
-
 		time.Sleep(100 * time.Millisecond)
 	}
 
 }
 
-// example function to show how to make an RPC call to the coordinator.
-//
-
+// mapSplit applies map function according to Task instructions
 func mapSplit(task Task, mapf func(string, string) []KeyValue) {
 
 	intermediate := []KeyValue{}
@@ -98,13 +89,17 @@ func mapSplit(task Task, mapf func(string, string) []KeyValue) {
 	writeToBuckets(intermediate, task)
 
 }
+
+// reduceSplits reduces n splits assigned as per filesuffix
 func reduceSplits(task Task, reducef func(string, []string) string) error {
 	filesuffix := task.FileName
 	filePaths, err := filepath.Glob("*_" + filesuffix + ".txt")
 	if err != nil {
 		return err
 	}
-	reducedData := make(map[string]int)
+	var keyValue KeyValue
+	var intermediate []KeyValue
+
 	for _, filePath := range filePaths {
 
 		file, err := os.Open(filePath)
@@ -114,14 +109,6 @@ func reduceSplits(task Task, reducef func(string, []string) string) error {
 
 		decoder := json.NewDecoder(file)
 
-		var keyValue struct {
-			Key   string
-			Value int
-		}
-		var keyValues []struct {
-			Key   string
-			Value int
-		}
 		for {
 			err := decoder.Decode(&keyValue)
 			if err != nil && err == io.EOF {
@@ -131,35 +118,48 @@ func reduceSplits(task Task, reducef func(string, []string) string) error {
 			if err != nil {
 				return err
 			}
-			keyValues = append(keyValues, keyValue)
+			intermediate = append(intermediate, keyValue)
 		}
 
-		for _, kv := range keyValues {
-			reducedData[kv.Key] += kv.Value
-		}
 		file.Close()
 	}
 	ofile := fmt.Sprintf("mr-out-%s", task.FileName)
-	//file, err := os.Create(ofile)
 	file, err := ioutil.TempFile("", ofile+"*")
 	if err != nil {
 		return err
 	}
+	sort.Sort(ByKey(intermediate))
 
-	for key, value := range reducedData {
-		fmt.Fprintf(file, "%v %v\n", key, value)
+	//we have slice of key values or intermediate here after that we will use code from mrsequential.go
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(file, "%v %v\n", intermediate[i].Key, output)
+		i = j
 	}
+	//atomically rename file to avoid conflicts between concurrent workers
 	err = os.Rename(file.Name(), ofile)
 	if err != nil {
 		return err
 	}
 	file.Close()
 
+	// inform the coordinator after completing the task
 	call(completeTaskFunction, &CompleteArgs{Task: task}, &CompleteReply{})
-
 	return nil
 }
 
+// requestTask takes next task from coordinator
 func requestTask() (*Task, error) {
 	args := MapArgs{}
 	reply := MapReply{}
@@ -171,13 +171,12 @@ func requestTask() (*Task, error) {
 	return &task, nil
 }
 
+// writeToBuckets assigns mapped results to files according to ihash
 func writeToBuckets(data []KeyValue, task Task) error {
 	sort.Sort(ByKey(data))
 
-	var outputkv struct {
-		Key   string
-		Value int
-	}
+	var output KeyValue
+
 	buckets := make([]*os.File, task.Buckets)
 
 	for i := 0; i < task.Buckets; i++ {
@@ -194,7 +193,6 @@ func writeToBuckets(data []KeyValue, task Task) error {
 	var enc *json.Encoder
 	for _, kv := range data {
 		key := kv.Key
-		value, _ := strconv.Atoi(kv.Value)
 
 		// hash  and assign new writer to encoder only if the current key != prevKey
 		if key != prevKey {
@@ -203,9 +201,9 @@ func writeToBuckets(data []KeyValue, task Task) error {
 			bucket := buckets[bucketIndex]
 			enc = json.NewEncoder(bucket)
 		}
-		outputkv.Key = key
-		outputkv.Value = value
-		enc.Encode(outputkv)
+		output.Key = kv.Key
+		output.Value = kv.Value
+		enc.Encode(output)
 		prevKey = key
 
 	}
@@ -218,6 +216,7 @@ func writeToBuckets(data []KeyValue, task Task) error {
 
 	}
 
+	// call the coordinator to make the task completed
 	call(completeTaskFunction, &CompleteArgs{Task: task}, &CompleteReply{})
 
 	return nil

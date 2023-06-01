@@ -83,7 +83,9 @@ $TIMEOUT ../mrworker ../../mrapps/wc.so &
 $TIMEOUT ../mrworker ../../mrapps/wc.so &
 
 # wait for the coordinator to exit.
+echo $pid
 wait $pid
+
 
 # since workers are required to exit when a job is completely finished,
 # and not before, that means the job has finished.
